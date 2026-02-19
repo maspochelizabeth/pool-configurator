@@ -2,118 +2,24 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Pool Configurator</title>
+  <title>Static Test</title>
   <style>
-    html, body {
+    body {
       margin: 0;
-      height: 100%;
-      overflow: hidden;
-      background: #f5f5f5;
-    }
-    canvas { display: block; }
-    #loading {
-      position: fixed;
-      top: 10px;
-      left: 10px;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: center;
       font-family: system-ui;
-      background: white;
-      padding: 8px 12px;
-      border-radius: 10px;
-      box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+      background: #f0f0f0;
+    }
+    h1 {
+      font-size: 40px;
     }
   </style>
 </head>
 <body>
-
-<div id="loading">Loading model...</div>
-
-<script type="module">
-  import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
-  import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
-  import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
-
-  console.log("Three loaded:", THREE.REVISION);
-
-  const scene = new THREE.Scene();
-  scene.background = new THREE.Color(0xf5f5f5);
-
-  const camera = new THREE.PerspectiveCamera(
-    45,
-    window.innerWidth / window.innerHeight,
-    0.1,
-    2000
-  );
-  camera.position.set(3, 2, 3);
-
-  const renderer = new THREE.WebGLRenderer({ antialias: true });
-  renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-  renderer.setSize(window.innerWidth, window.innerHeight);
-  document.body.appendChild(renderer.domElement);
-
-  // Lighting
-  scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
-  const dirLight = new THREE.DirectionalLight(0xffffff, 1);
-  dirLight.position.set(5, 8, 5);
-  scene.add(dirLight);
-
-  const controls = new OrbitControls(camera, renderer.domElement);
-  controls.enableDamping = true;
-
-  const loader = new GLTFLoader();
-
-  // 🔥 USING YOUR WIX STATIC URL DIRECTLY
-  const modelURL = "https://static.wixstatic.com/3d/7f743c_eb66e40bfa5b465b86a173fd1f459ce7.glb";
-
-  let currentModel = null;
-
-  loader.load(
-    modelURL,
-    (gltf) => {
-      currentModel = gltf.scene;
-      scene.add(currentModel);
-
-      // Auto-frame
-      const box = new THREE.Box3().setFromObject(currentModel);
-      const size = box.getSize(new THREE.Vector3());
-      const center = box.getCenter(new THREE.Vector3());
-
-      controls.target.copy(center);
-
-      const maxDim = Math.max(size.x, size.y, size.z);
-      const fov = camera.fov * (Math.PI / 180);
-      let cameraZ = Math.abs(maxDim / (2 * Math.tan(fov / 2)));
-      cameraZ *= 1.6;
-
-      camera.position.set(center.x + cameraZ, center.y + cameraZ * 0.35, center.z + cameraZ);
-      camera.near = maxDim / 100;
-      camera.far = maxDim * 100;
-      camera.updateProjectionMatrix();
-
-      controls.update();
-
-      document.getElementById("loading").remove();
-    },
-    undefined,
-    (error) => {
-      console.error("GLB load error:", error);
-      document.getElementById("loading").textContent =
-        "Failed to load model. Check console.";
-    }
-  );
-
-  function animate() {
-    requestAnimationFrame(animate);
-    controls.update();
-    renderer.render(scene, camera);
-  }
-  animate();
-
-  window.addEventListener("resize", () => {
-    camera.aspect = window.innerWidth / window.innerHeight;
-    camera.updateProjectionMatrix();
-    renderer.setSize(window.innerWidth, window.innerHeight);
-  });
-</script>
-
+  <h1>Vercel is working 🚀</h1>
 </body>
 </html>
+
