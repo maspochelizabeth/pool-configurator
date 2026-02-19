@@ -1,83 +1,483 @@
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>Pool Configurator</title>
-  <style>
-    html, body { margin:0; height:100%; overflow:hidden; }
-    canvas { display:block; }
-    #loading {
-      position: fixed;
-      top: 10px;
-      left: 10px;
-      font-family: system-ui;
-      background: white;
-      padding: 6px 10px;
-      border-radius: 8px;
-    }
-  </style>
-</head>
-<body>
-  <div id="loading">Loading model...</div>
+"""
+Event-based Screen Region Recorder (Record / Pause / Stop)
 
-  <script type="module">
-    import * as THREE from "https://unpkg.com/three@0.160.0/build/three.module.js";
-    import { OrbitControls } from "https://unpkg.com/three@0.160.0/examples/jsm/controls/OrbitControls.js";
-    import { GLTFLoader } from "https://unpkg.com/three@0.160.0/examples/jsm/loaders/GLTFLoader.js";
+What it does
+- Shows a small UI with Record, Pause, Stop
+- Lets you choose a destination folder (Browse…)
+- On Record: drag-select a rectangle on your screen
+- While recording: captures screenshots of that region on:
+    * mouse clicks
+    * key presses (NON-alphanumeric only; ignores A–Z and 0–9)
+    * active-window change (polled)
+- Adds a small delay (ms) before taking each screenshot so UI can settle
+- Saves PNGs to a timestamped folder inside the destination folder
 
-    const scene = new THREE.Scene();
-    scene.background = new THREE.Color(0xf5f5f5);
+Install deps:
+    python -m pip install mss pillow pynput pygetwindow
+"""
 
-    const camera = new THREE.PerspectiveCamera(45, window.innerWidth/window.innerHeight, 0.1, 2000);
-    camera.position.set(3,2,3);
+import os
+import time
+import threading
+import queue
+from dataclasses import dataclass
+from datetime import datetime
 
-    const renderer = new THREE.WebGLRenderer({ antialias:true });
-    renderer.setSize(window.innerWidth, window.innerHeight);
-    renderer.setPixelRatio(Math.min(window.devicePixelRatio,2));
-    document.body.appendChild(renderer.domElement);
+import tkinter as tk
+from tkinter import messagebox, filedialog
 
-    scene.add(new THREE.HemisphereLight(0xffffff, 0x444444, 1.2));
-    const dir = new THREE.DirectionalLight(0xffffff, 1);
-    dir.position.set(5,8,5);
-    scene.add(dir);
+from PIL import Image
+import mss
 
-    const controls = new OrbitControls(camera, renderer.domElement);
-    controls.enableDamping = true;
+from pynput import mouse, keyboard
 
-    const loader = new GLTFLoader();
-
-    loader.load(
-      "./models/miami.glb",
-      (gltf) => {
-        const model = gltf.scene;
-        scene.add(model);
-        document.getElementById("loading").remove();
-      },
-      undefined,
-      (err) => {
-        console.error("GLB load error:", err);
-        document.getElementById("loading").textContent =
-          "Failed to load model. Open console.";
-      }
-    );
+try:
+    import pygetwindow as gw
+except Exception:
+    gw = None
 
 
-    function animate(){
-      requestAnimationFrame(animate);
-      controls.update();
-      renderer.render(scene, camera);
-    }
-    animate();
-
-    window.addEventListener("resize", ()=>{
-      camera.aspect = window.innerWidth/window.innerHeight;
-      camera.updateProjectionMatrix();
-      renderer.setSize(window.innerWidth, window.innerHeight);
-    });
-
-  </script>
-</body>
-</html>
+# -----------------------------
+# Helpers / data
+# -----------------------------
+@dataclass
+class Region:
+    left: int
+    top: int
+    width: int
+    height: int
 
 
+def ts() -> str:
+    return datetime.now().strftime("%Y%m%d_%H%M%S_%f")
 
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+# -----------------------------
+# Region selection overlay
+# -----------------------------
+class RegionSelector:
+    """
+    Fullscreen overlay to drag a rectangle and return the selected region in screen coords.
+    """
+    def __init__(self, parent: tk.Tk):
+        self.parent = parent
+        self.overlay = tk.Toplevel(parent)
+        self.overlay.withdraw()
+        self.overlay.attributes("-topmost", True)
+        self.overlay.attributes("-fullscreen", True)
+        self.overlay.configure(bg="black")
+        self.overlay.attributes("-alpha", 0.25)
+
+        self.canvas = tk.Canvas(self.overlay, cursor="cross", bg="black", highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+
+        self.start_x = None
+        self.start_y = None
+        self.rect_id = None
+        self.done = threading.Event()
+        self.region = None
+
+        self.canvas.bind("<ButtonPress-1>", self.on_press)
+        self.canvas.bind("<B1-Motion>", self.on_drag)
+        self.canvas.bind("<ButtonRelease-1>", self.on_release)
+        self.overlay.bind("<Escape>", self.on_escape)
+
+    def on_press(self, event):
+        self.start_x, self.start_y = event.x, event.y
+        if self.rect_id:
+            self.canvas.delete(self.rect_id)
+            self.rect_id = None
+        self.rect_id = self.canvas.create_rectangle(
+            self.start_x, self.start_y, self.start_x, self.start_y,
+            outline="red", width=2
+        )
+
+    def on_drag(self, event):
+        if self.rect_id and self.start_x is not None and self.start_y is not None:
+            self.canvas.coords(self.rect_id, self.start_x, self.start_y, event.x, event.y)
+
+    def on_release(self, event):
+        if self.start_x is None or self.start_y is None:
+            return
+
+        x1, y1 = self.start_x, self.start_y
+        x2, y2 = event.x, event.y
+
+        left = min(x1, x2)
+        top = min(y1, y2)
+        right = max(x1, x2)
+        bottom = max(y1, y2)
+
+        width = right - left
+        height = bottom - top
+
+        if width < 10 or height < 10:
+            messagebox.showwarning("Too small", "Selection too small. Drag a larger rectangle.", parent=self.parent)
+            return
+
+        self.region = Region(left=left, top=top, width=width, height=height)
+        self.done.set()
+        self.hide()
+
+    def on_escape(self, _event=None):
+        self.region = None
+        self.done.set()
+        self.hide()
+
+    def show_and_select(self) -> Region | None:
+        self.done.clear()
+        self.region = None
+        self.overlay.deiconify()
+        self.overlay.lift()
+        self.overlay.focus_force()
+        self.overlay.update()
+
+        while not self.done.is_set():
+            self.overlay.update()
+            time.sleep(0.01)
+
+        return self.region
+
+    def hide(self):
+        try:
+            self.overlay.withdraw()
+        except Exception:
+            pass
+
+
+# -----------------------------
+# Recorder core
+# -----------------------------
+class EventRecorder:
+    def __init__(self, on_status):
+        self.on_status = on_status
+
+        self.region: Region | None = None
+        self.output_dir: str | None = None
+
+        # destination folder where timestamped run folders are created
+        self.base_dir: str = os.path.join(os.path.expanduser("~"), "Documents", "EventRecorderRuns")
+
+        # delay before each screenshot (ms) so UI has time to update
+        self.capture_delay_ms: int = 50
+
+        self._recording = threading.Event()
+        self._paused = threading.Event()
+        self._stop = threading.Event()
+
+        self._events = queue.Queue()
+        self._worker_thread: threading.Thread | None = None
+        self._poll_thread: threading.Thread | None = None
+
+        self._mouse_listener = None
+        self._key_listener = None
+
+        self._last_capture_at = 0.0
+        self.min_interval_s = 0.35  # throttle bursts
+
+        self._last_window = None
+
+    def set_region(self, region: Region):
+        self.region = region
+
+    def set_base_dir(self, base_dir: str):
+        if base_dir and os.path.isdir(base_dir):
+            self.base_dir = base_dir
+
+    def start(self):
+        if not self.region:
+            raise RuntimeError("No region selected.")
+        if not self.base_dir:
+            raise RuntimeError("No destination folder set.")
+
+        self._stop.clear()
+        self._recording.set()
+        self._paused.clear()
+
+        run_stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        ensure_dir(self.base_dir)
+
+        self.output_dir = os.path.join(self.base_dir, f"screen_record_{run_stamp}")
+        ensure_dir(self.output_dir)
+
+        self._worker_thread = threading.Thread(target=self._worker_loop, daemon=True)
+        self._worker_thread.start()
+
+        self._start_listeners()
+        self._start_window_poll()
+
+        self.on_status(f"Recording… saving to: {self.output_dir}")
+
+    def pause(self):
+        if not self._recording.is_set():
+            return
+        if not self._paused.is_set():
+            self._paused.set()
+            self.on_status("Paused.")
+        else:
+            self._paused.clear()
+            self.on_status("Recording…")
+
+    def stop(self):
+        if not self._recording.is_set():
+            return
+        self._stop.set()
+        self._recording.clear()
+        self._paused.clear()
+
+        self._stop_listeners()
+        self.on_status("Stopping…")
+
+    def is_recording(self) -> bool:
+        return self._recording.is_set()
+
+    def is_paused(self) -> bool:
+        return self._paused.is_set()
+
+    # ---- listeners ----
+    def _start_listeners(self):
+        def on_click(x, y, button, pressed):
+            if pressed:
+                self._enqueue_event("mouse_click", f"{button}")
+
+        def on_press(key):
+            # Ignore alphanumeric keys (A–Z, 0–9)
+            if hasattr(key, "char") and key.char is not None:
+                if key.char.isalnum():
+                    return
+            # Capture non-alphanumeric keys (Ctrl, Shift, Enter, etc.)
+            self._enqueue_event("key_press", str(key))
+
+        self._mouse_listener = mouse.Listener(on_click=on_click)
+        self._key_listener = keyboard.Listener(on_press=on_press)
+        self._mouse_listener.start()
+        self._key_listener.start()
+
+    def _stop_listeners(self):
+        try:
+            if self._mouse_listener:
+                self._mouse_listener.stop()
+        except Exception:
+            pass
+        try:
+            if self._key_listener:
+                self._key_listener.stop()
+        except Exception:
+            pass
+
+    # ---- window change polling ----
+    def _start_window_poll(self):
+        self._poll_thread = threading.Thread(target=self._window_poll_loop, daemon=True)
+        self._poll_thread.start()
+
+    def _get_active_window_title(self):
+        if gw is None:
+            return None
+        try:
+            w = gw.getActiveWindow()
+            if not w:
+                return None
+            title = (w.title or "").strip()
+            return title
+        except Exception:
+            return None
+
+    def _window_poll_loop(self):
+        self._last_window = self._get_active_window_title()
+        while not self._stop.is_set():
+            if self._recording.is_set() and not self._paused.is_set():
+                cur = self._get_active_window_title()
+                if cur is not None and cur != self._last_window:
+                    self._last_window = cur
+                    self._enqueue_event("window_change", cur[:80])
+            time.sleep(0.5)
+
+    # ---- event queue / capture worker ----
+    def _enqueue_event(self, kind: str, detail: str):
+        if not self._recording.is_set() or self._paused.is_set():
+            return
+        now = time.time()
+        if (now - self._last_capture_at) < self.min_interval_s:
+            return
+        self._last_capture_at = now
+        self._events.put((kind, detail, now))
+
+    def _worker_loop(self):
+        if not self.region:
+            return
+
+        with mss.mss() as sct:
+            monitor = {
+                "left": self.region.left,
+                "top": self.region.top,
+                "width": self.region.width,
+                "height": self.region.height,
+            }
+
+            while not self._stop.is_set() or not self._events.empty():
+                try:
+                    kind, detail, _t_event = self._events.get(timeout=0.25)
+                except queue.Empty:
+                    continue
+
+                if self._paused.is_set():
+                    continue
+
+                # Delay a few ms so the UI/state has time to update before capture
+                time.sleep(self.capture_delay_ms / 1000.0)
+
+                img = sct.grab(monitor)
+                pil = Image.frombytes("RGB", img.size, img.bgra, "raw", "BGRX")
+
+                safe_kind = "".join(c for c in kind if c.isalnum() or c in ("_", "-"))
+                safe_detail = "".join(c for c in detail if c.isalnum() or c in ("_", "-", "."))[:40]
+                filename = f"{ts()}__{safe_kind}__{safe_detail}.png"
+                out_path = os.path.join(self.output_dir or os.getcwd(), filename)
+                pil.save(out_path, "PNG")
+
+        self.on_status("Stopped. Screenshots saved.")
+
+
+# -----------------------------
+# UI app
+# -----------------------------
+class App:
+    def __init__(self, root: tk.Tk):
+        self.root = root
+        root.title("Event Screen Recorder")
+        root.geometry("620x260")
+
+        self.status_var = tk.StringVar(value="Ready.")
+        self.region_var = tk.StringVar(value="Region: (none)")
+
+        default_dest = os.path.join(os.path.expanduser("~"), "Documents", "EventRecorderRuns")
+        self.dest_var = tk.StringVar(value=default_dest)
+
+        self.selector = RegionSelector(root)
+        self.recorder = EventRecorder(self.set_status)
+        self.recorder.set_base_dir(default_dest)
+
+        frame = tk.Frame(root, padx=14, pady=14)
+        frame.pack(fill="both", expand=True)
+
+        tk.Label(frame, text="Event-based Screen Region Recorder", font=("Segoe UI", 12, "bold")).pack(anchor="w")
+
+        dest_row = tk.Frame(frame)
+        dest_row.pack(fill="x", pady=(10, 0))
+
+        tk.Label(dest_row, text="Save to folder:").pack(side="left")
+        self.dest_entry = tk.Entry(dest_row, textvariable=self.dest_var)
+        self.dest_entry.pack(side="left", fill="x", expand=True, padx=(8, 8))
+        tk.Button(dest_row, text="Browse…", width=10, command=self.on_browse).pack(side="left")
+
+        tk.Label(frame, textvariable=self.region_var).pack(anchor="w", pady=(10, 0))
+        tk.Label(frame, textvariable=self.status_var, wraplength=580).pack(anchor="w", pady=(6, 14))
+
+        btn_row = tk.Frame(frame)
+        btn_row.pack(anchor="w", pady=(8, 0))
+
+        self.btn_record = tk.Button(btn_row, text="Record", width=12, command=self.on_record)
+        self.btn_pause = tk.Button(btn_row, text="Pause", width=12, command=self.on_pause, state="disabled")
+        self.btn_stop = tk.Button(btn_row, text="Stop", width=12, command=self.on_stop, state="disabled")
+
+        self.btn_record.grid(row=0, column=0, padx=(0, 10))
+        self.btn_pause.grid(row=0, column=1, padx=(0, 10))
+        self.btn_stop.grid(row=0, column=2)
+
+        tk.Label(
+            frame,
+            text="Tip: Press Esc during selection to cancel.\n"
+                 "A new timestamped folder will be created inside your chosen destination.",
+            fg="gray"
+        ).pack(anchor="w", pady=(14, 0))
+
+        self.root.protocol("WM_DELETE_WINDOW", self.on_close)
+
+    def set_status(self, text: str):
+        def _set():
+            self.status_var.set(text)
+        self.root.after(0, _set)
+
+    def on_browse(self):
+        folder = filedialog.askdirectory(parent=self.root, title="Choose destination folder")
+        if not folder:
+            return
+        self.dest_var.set(folder)
+        self.recorder.set_base_dir(folder)
+
+    def on_record(self):
+        if self.recorder.is_recording():
+            return
+
+        dest = (self.dest_var.get() or "").strip()
+        if not dest:
+            messagebox.showwarning("Destination needed", "Please choose a destination folder.", parent=self.root)
+            return
+        if not os.path.isdir(dest):
+            if messagebox.askyesno("Create folder?", f"Folder does not exist:\n\n{dest}\n\nCreate it?", parent=self.root):
+                try:
+                    os.makedirs(dest, exist_ok=True)
+                except Exception as e:
+                    messagebox.showerror("Error", f"Could not create folder:\n{e}", parent=self.root)
+                    return
+            else:
+                return
+
+        self.recorder.set_base_dir(dest)
+
+        self.set_status("Select a region by click-dragging a rectangle… (Esc to cancel)")
+        region = self.selector.show_and_select()
+
+        if not region:
+            self.set_status("Region selection cancelled.")
+            return
+
+        self.recorder.set_region(region)
+        self.region_var.set(f"Region: left={region.left}, top={region.top}, w={region.width}, h={region.height}")
+
+        try:
+            self.recorder.start()
+        except Exception as e:
+            messagebox.showerror("Error", str(e), parent=self.root)
+            self.set_status("Failed to start.")
+            return
+
+        self.btn_record.config(state="disabled")
+        self.btn_pause.config(state="normal", text="Pause")
+        self.btn_stop.config(state="normal")
+
+    def on_pause(self):
+        if not self.recorder.is_recording():
+            return
+        self.recorder.pause()
+        self.btn_pause.config(text="Resume" if self.recorder.is_paused() else "Pause")
+
+    def on_stop(self):
+        if not self.recorder.is_recording():
+            return
+        self.recorder.stop()
+
+        self.btn_record.config(state="normal")
+        self.btn_pause.config(state="disabled", text="Pause")
+        self.btn_stop.config(state="disabled")
+
+    def on_close(self):
+        try:
+            if self.recorder.is_recording():
+                self.recorder.stop()
+        finally:
+            self.root.destroy()
+
+
+def main():
+    root = tk.Tk()
+    App(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
